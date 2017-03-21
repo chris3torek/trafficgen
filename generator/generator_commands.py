@@ -313,8 +313,8 @@ def _monitor_ports(cli, *ports):
             total['out_bytes'] += stat['out_bytes']
         return total
 
-    def get_all_stats(cli, sess):
-        stats = cli.bess.get_port_stats(sess.port())
+    def get_all_stats(cli, sess, port):
+        stats = cli.bess.get_port_stats(port)
         try:
             ret = {
                 'inc_packets': stats.inc.packets,
@@ -374,14 +374,15 @@ def _monitor_ports(cli, *ports):
 
     for port in ports:
         sess = cli.get_session(port)
-        last[port] = get_all_stats(cli, sess)
+        last[port] = get_all_stats(cli, sess, port)
+        print(port, last[port])
     try:
         while True:
             time.sleep(1)
 
             for port in ports:
                 sess = cli.get_session(port)
-                now[port] = get_all_stats(cli, sess)
+                now[port] = get_all_stats(cli, sess, port)
 
             print_header(now[port]['timestamp'])
 
@@ -394,7 +395,7 @@ def _monitor_ports(cli, *ports):
             if len(ports) > 1:
                 print_delta('Total', get_delta(
                         get_total(last.values()),
-                        get_total(now.values())))
+                        get_total(now.values())), now[port]['timestamp'])
 
             for port in ports:
                 last[port] = now[port]
@@ -452,16 +453,20 @@ def _create_port_args(cli, port_id, num_cores):
     return args
 
 
-@cmd('start PORT MODE [TRAFFIC_SPEC...]', 'Start sending packets on a port')
-def start(cli, port, mode, spec):
+@cmd('start PORT -> PORT MODE [TRAFFIC_SPEC...]', 'Start sending packets on a port')
+def start(cli, tx_port, rx_port, mode, spec):
     setup_mclasses(cli, globals())
     global available_cores
-    if not isinstance(port, str):
-        raise cli.CommandError('Port identifier must be a string')
+    if not isinstance(tx_port, str) or not isinstance(rx_port, str):
+        raise cli.CommandError('Port identifiers must be a strings')
 
-    if cli.port_is_running(port):
-        bess_commands.warn(cli, 'Port %s is already running.' % (port,),
-                           _stop, port)
+    if cli.port_is_running(tx_port):
+        bess_commands.warn(cli, 'Port %s is already running.' % (tx_port,),
+                           _stop, tx_port)
+
+    if cli.port_is_running(rx_port):
+        bess_commands.warn(cli, 'Port %s is already running.' % (rx_port,),
+                           _stop, rx_port)
 
     # Allocate cores if necessary
     if spec is not None:
@@ -493,11 +498,15 @@ def start(cli, port, mode, spec):
     num_tx_cores = len(tx_cores)
     num_rx_cores = len(rx_cores)
     num_cores = num_tx_cores + num_rx_cores
-    port_args = _create_port_args(cli, port, max(num_tx_cores, num_rx_cores))
+    tx_port_args = _create_port_args(cli, tx_port, max(num_tx_cores, num_rx_cores))
+    rx_port_args = _create_port_args(cli, rx_port, max(num_tx_cores, num_rx_cores))
     with cli.bess_lock:
-        ret = cli.bess.create_port(port_args['driver'], port_args['name'],
-                                   arg=port_args['arg'])
-        port = ret.name
+        ret = cli.bess.create_port(tx_port_args['driver'], tx_port_args['name'],
+                                   arg=tx_port_args['arg'])
+        tx_port = ret.name
+        ret = cli.bess.create_port(rx_port_args['driver'], rx_port_args['name'],
+                                   arg=rx_port_args['arg'])
+        rx_port = ret.name
 
     if spec is not None and 'src_mac' not in spec:
         spec['src_mac'] = ret.mac_addr
@@ -528,11 +537,11 @@ def start(cli, port, mode, spec):
         # Setup TX pipelines
         for i, core in enumerate(tx_cores):
             cli.bess.add_worker(wid=core, core=core)
-            tx_pipe = tmode.setup_tx_pipeline(cli, port, ts)
+            tx_pipe = tmode.setup_tx_pipeline(cli, tx_port, ts)
 
             # These modules are required across all pipelines
             tx_pipe.modules += [Timestamp(offset=ts.tx_timestamp_offset),
-                                 QueueOut(port=port, qid=i)]
+                                 QueueOut(port=tx_port, qid=i)]
             tx_pipes[core] = tx_pipe
 
             # Setup rate limiting, pin pipelines to cores, connect pipelines
@@ -567,19 +576,19 @@ def start(cli, port, mode, spec):
         for i, core in enumerate(rx_cores):
             if core not in tx_cores:
                 cli.bess.add_worker(wid=core, core=core)
-            rx_pipe = tmode.setup_rx_pipeline(cli, port, ts)
+            rx_pipe = tmode.setup_rx_pipeline(cli, rx_port, ts)
 
             queues = []
             if core in rx_qids and len(rx_qids[core]) > 1:
                 m = Merge()
                 front = [m]
                 for j, qid in enumerate(rx_qids[core]):
-                    q = QueueInc(port=port, qid=qid)
+                    q = QueueInc(port=rx_port, qid=qid)
                     queues.append(q)
                     cli.bess.attach_task(q.name, 0, wid=core)
                     q.connect(m, igate=j)
             else:
-                front = [QueueInc(port=port, qid=i)]
+                front = [QueueInc(port=rx_port, qid=i)]
 
             front += [Measure(offset=ts.rx_timestamp_offset)]
             rx_pipe.modules = front + rx_pipe.modules
@@ -594,12 +603,13 @@ def start(cli, port, mode, spec):
 
         cli.bess.resume_all()
 
-    cli.add_session(Session(port, ts, mode, tx_pipes, rx_pipes))
+    cli.add_session(Session(tx_port, rx_port, ts, mode, tx_pipes, rx_pipes))
 
 
 def _stop(cli, port):
     global available_cores
     sess = cli.remove_session(port)
+    cli.remove_session(str(sess.rx_port()))
     reclaimed_cores = sess.spec().tx_cores + sess.spec().rx_cores
     available_cores = list(sorted(available_cores + reclaimed_cores))
     with cli.bess_lock:
@@ -619,11 +629,12 @@ def _stop(cli, port):
             for worker in workers:
                 cli.bess.destroy_worker(worker)
 
-            cli.bess.destroy_port(sess.port())
+            cli.bess.destroy_port(sess.tx_port())
+            cli.bess.destroy_port(sess.rx_port())
         finally:
             cli.bess.resume_all()
 
 @cmd('stop PORT...', 'Stop sending packets on a set of ports')
-def stop(cli, ports):
+def stop(cli, tx_ports):
     for port in ports:
-        _stop(cli, port)
+        _stop(cli, tx_port)

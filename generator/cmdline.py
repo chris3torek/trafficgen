@@ -20,6 +20,7 @@ class TGENCLI(cli.CLI):
         self.bess = bess
         self.bess_lock = threading.Lock()
         self.cmd_db = cmd_db
+        self.__ports = dict()
         self.__running = dict() 
         self.__running_lock = threading.Lock()
         self.__monitor_thread = None
@@ -41,17 +42,18 @@ class TGENCLI(cli.CLI):
 
     def add_session(self, sess):
         with self.__running_lock:
-            self.__running[str(sess.port())] = sess
+            self.__running[str(sess.tx_port())] = sess
+        self.__ports[str(sess.tx_port())] = sess
+        self.__ports[str(sess.rx_port())] = sess
 
     def remove_session(self, port):
         with self.__running_lock:
             ret = self.__running.pop(port, None)
+        self.__ports.pop(port, None)
         return ret
 
     def get_session(self, port):
-        with self.__running_lock:
-            ret = self.__running.get(str(port), None)
-        return ret
+        return self.__ports.get(str(port), None)
 
     def clear_sessions(self):
         with self.__running_lock:
