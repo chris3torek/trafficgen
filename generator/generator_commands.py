@@ -503,9 +503,10 @@ def start(cli, tx_port, rx_port, mode, spec):
     with cli.bess_lock:
         ret = cli.bess.create_port(tx_port_args['driver'], tx_port_args['name'],
                                    arg=tx_port_args['arg'])
+        if tx_port != rx_port:
+            ret = cli.bess.create_port(rx_port_args['driver'], rx_port_args['name'],
+                                       arg=rx_port_args['arg'])
         tx_port = ret.name
-        ret = cli.bess.create_port(rx_port_args['driver'], rx_port_args['name'],
-                                   arg=rx_port_args['arg'])
         rx_port = ret.name
 
     if spec is not None and 'src_mac' not in spec:
